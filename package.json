@@ -1,0 +1,19 @@
+{
+  "name": "aws-node-photo-resize-lambda",
+  "version": "0.5.0",
+  "description": "An S3 lamda written in Node.js that processes images uploaded to an S3 bucket and resizes them and performs other web optimizations.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xvandish/aws-node-photo-resize-lambda.git"
+  },
+  "author": "Rodrigo Silva Mendoza",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/xvandish/aws-node-photo-resize-lambda/issues"
+  },
+  "homepage": "https://github.com/xvandish/aws-node-photo-resize-lambda#readme"
+}
