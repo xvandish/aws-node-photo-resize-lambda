@@ -1,7 +1,7 @@
 {
   "name": "aws-node-photo-resize-lambda",
   "version": "0.5.0",
-  "description": "An S3 lamda written in Node.js that processes images uploaded to an S3 bucket and resizes them and performs other web optimizations.",
+  "description": "An S3 lambda written in Node.js that processes images uploaded to an S3 bucket and resizes them and performs other web optimizations.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -15,5 +15,11 @@
   "bugs": {
     "url": "https://github.com/xvandish/aws-node-photo-resize-lambda/issues"
   },
-  "homepage": "https://github.com/xvandish/aws-node-photo-resize-lambda#readme"
+  "homepage": "https://github.com/xvandish/aws-node-photo-resize-lambda#readme",
+  "devDependencies": {
+    "aws-sdk": "^2.858.0"
+  },
+  "dependencies": {
+    "sharp": "^0.27.2"
+  }
 }
