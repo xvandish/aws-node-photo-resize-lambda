@@ -21,6 +21,4 @@ async function test() {
   });
 }
 
-console.time('whole');
 test();
-console.timeEnd('whole');
