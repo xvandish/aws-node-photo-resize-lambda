@@ -2,6 +2,18 @@ const AWS = require('aws-sdk');
 const sharp = require('sharp');
 const util = require('util');
 const s3 = new AWS.S3();
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  max: 1,
+  min: 0,
+  idleTimeoutMillis: 120000,
+  connectionTimeoutMillis: 10000,
+  host: process.env.PHOTOS_META_DB_HOST,
+  user: process.env.PHOTOS_META_DB_USER,
+  password: process.env.PHOTOS_META_DB_PASSWORD,
+  port: process.env.PHOTOS_META_DB_PORT,
+});
 
 /**
  *
@@ -95,15 +107,33 @@ exports.handler = async (event) => {
   const originalImage = await getOriginalImage(srcBucket, srcKey);
   if (originalImage instanceof Error) return;
 
+  // To store our results, we'll need a db connection
+  // If we can't get one, terminate, as we don't want to store results in S3 with
+  // no record of them existing in the DB
+  //   const query = {
+  //   text: 'INSERT INTO users(name, email) VALUES($1, $2)',
+  //   values: ['brianc', 'brian.m.carlson@gmail.com'],
+  // }
+  let client;
+  client = await pool.connect().catch((err) => {
+    console.log('could not get client from PG pool');
+    console.log(err.stack);
+    process.exit(-1);
+  });
+
+  console.log('succesfully connected to client');
+  client.release(); // release right away for now
+
   console.time('create initial sharp instance');
   // Add rotation because even with EXIF metadata images come out with the wrong orientation
   const startingImage = await sharp(originalImage.Body).rotate();
   console.timeEnd('create initial sharp instance');
 
   const parts = srcKey.split('/'); // 2020/nyc/manhattan_valley/thing.jpeg -> [2020, nyc, manhattan_valley, thing.jpeg]
-  const imgName = parts[parts.length - 1].replace(typeMatch, '');
+  const imgName = parts[parts.length - 1].replace(typeMatch[0], '');
   const imgDir = `${parts.slice(0, -1).join('/')}/`;
 
+  console.time('starting to convert to different sizes and formats');
   await Promise.all(
     outputPhotoSizes.map(async (photoSize) => {
       console.log('working through size: ', photoSize);
@@ -114,12 +144,19 @@ exports.handler = async (event) => {
       await Promise.all(
         outputFormats.map(async (format) => {
           console.log('working through format', format);
+          console.time(`converted ${imgName} at ${photoSize.prefix} to ${format.format}`);
           const imgBuffer = await convertImageToFormatAndReturnBuffer(
             resized.clone(),
             format
           );
+          console.timeEnd(
+            `converted ${imgName} at ${photoSize.prefix} to ${format.format}`
+          );
           if (imgBuffer instanceof Error) return Promise.reject(imgBuffer);
-          return uploadImageToS3(
+          console.time(
+            `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
+          );
+          await uploadImageToS3(
             imgBuffer,
             imgName,
             format.format,
@@ -127,11 +164,21 @@ exports.handler = async (event) => {
             imgDir,
             process.env.RESIZED_PHOTOS_BUCKET
           );
+          console.timeEnd(
+            `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
+          );
         })
-      ).catch((err) => {
-        console.log(err);
-        return;
-      });
+      )
+        .then(() => {
+          console.log(
+            `finished formatting and uploading all formats at ${photoSize.prefix}`
+          );
+        })
+        .catch((err) => {
+          console.log(err);
+          return;
+        });
     })
   );
+  console.timeEnd('starting to convert to different sizes and formats');
 };

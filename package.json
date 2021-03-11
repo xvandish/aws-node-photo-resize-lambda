@@ -18,9 +18,9 @@
   "homepage": "https://github.com/xvandish/aws-node-photo-resize-lambda#readme",
   "devDependencies": {
     "aws-sdk": "^2.858.0",
-    "eslint": "^7.21.0"
-  },
-  "dependencies": {
+    "eslint": "^7.21.0",
+    "pg": "^8.5.1",
     "sharp": "^0.27.2"
-  }
+  },
+  "dependencies": {}
 }
