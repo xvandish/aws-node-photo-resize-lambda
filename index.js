@@ -13,29 +13,48 @@ const pool = new Pool({
   user: process.env.PHOTOS_META_DB_USER,
   password: process.env.PHOTOS_META_DB_PASSWORD,
   port: process.env.PHOTOS_META_DB_PORT,
+  database: process.env.PHOTOS_META_DB_NAME,
 });
 
 /**
  *
  * @param {string} bucket - name of the bucket
  * @param {string} key - name of the key
- * @param {s3} s3 - instantiated s3 object
+ * @param {AWS.S3} s3 - instantiated s3 object
  */
 async function getOriginalImage(bucket, key) {
   const imageLocation = { Bucket: bucket, Key: key };
+  console.log('trying to getOriginalImage');
   try {
     const originalImage = await s3.getObject(imageLocation).promise();
+    console.log('got back originalImage', originalImage.Body.length);
     return originalImage;
   } catch (err) {
-    console.log(err);
+    console.error(err);
     return new Error('failed to download original image');
   }
 }
 
 /**
  *
+ * @param {AWS.S3.GetObjectOutput} imageBlobFromS3
+ * @param {string} imgNameNoExt
+ * Attempt to get altText from the metadata map stored by the file in S3
+ * Otherwise, use the image name, stripped of separators, as the altText
+ */
+function getImageAltText(imageBlobFromS3, imgNameNoExt) {
+  const { altText } = imageBlobFromS3.Metadata;
+  if (altText) return altText;
+
+  // If there is no user defined alt text, take the img name with
+  // any separator between words (hyphen,underscore, anything,) stripped out
+  return imgNameNoExt.replace(/[^A-Z0-9]/gi, ' ');
+}
+
+/**
+ *
  * @param {sharp.Sharp} sharpImage
- * @param {*} desiredFormat
+ * @param {string} desiredFormat
  */
 function convertImageToFormatAndReturnBuffer(sharpImage, desiredFormat) {
   return sharpImage[desiredFormat.format]({ quality: desiredFormat.quality }).toBuffer();
@@ -104,36 +123,70 @@ exports.handler = async (event) => {
     return;
   }
 
+  console.table([srcBucket, srcKey, imageType]);
+
   const originalImage = await getOriginalImage(srcBucket, srcKey);
   if (originalImage instanceof Error) return;
+  console.log('succesfully recieved originalImage');
 
   // To store our results, we'll need a db connection
   // If we can't get one, terminate, as we don't want to store results in S3 with
   // no record of them existing in the DB
-  //   const query = {
-  //   text: 'INSERT INTO users(name, email) VALUES($1, $2)',
-  //   values: ['brianc', 'brian.m.carlson@gmail.com'],
-  // }
   let client;
-  client = await pool.connect().catch((err) => {
-    console.log('could not get client from PG pool');
-    console.log(err.stack);
-    process.exit(-1);
-  });
+  client = await pool
+    .connect()
+    .then((client) => {
+      console.log('recieved client succesfully');
+      return client;
+    })
+    .catch((err) => {
+      console.error('could not get client from PG pool');
+      console.error(err.stack);
+      return Promise.reject('could not initialize db call');
+    });
 
   console.log('succesfully connected to client');
-  client.release(); // release right away for now
 
   console.time('create initial sharp instance');
-  // Add rotation because even with EXIF metadata images come out with the wrong orientation
+  // Add rotation because even if the EXIF metadata of the final images
+  // mentions the correct orientation, it isn't applied automatically
   const startingImage = await sharp(originalImage.Body).rotate();
   console.timeEnd('create initial sharp instance');
 
-  const parts = srcKey.split('/'); // 2020/nyc/manhattan_valley/thing.jpeg -> [2020, nyc, manhattan_valley, thing.jpeg]
-  const imgName = parts[parts.length - 1].replace(typeMatch[0], '');
-  const imgDir = `${parts.slice(0, -1).join('/')}/`;
+  // Derive information about the image based on path
+  // TODO: fix this next line in case subAlbum is null
+  var countOfSlash = srcKey.match(/\//g).length;
+  const hasSubalbum = countOfSlash === 3;
+  let year;
+  let album;
+  let subAlbum = null;
+  let fileNameWithExt;
+  const pathParts = srcKey.split('/'); // 2020/nyc/manhattan_valley/thing.jpeg -> [2020, nyc, manhattan_valley, thing.jpeg]
+  if (hasSubalbum) {
+    [year, album, subAlbum, fileNameWithExt] = pathParts;
+  } else {
+    [year, album, fileNameWithExt] = pathParts;
+  }
+  const imgName = fileNameWithExt.replace(typeMatch[0], ''); // replace the extension with an empty string
+  const imgDir = pathParts.slice(0, -1).join('/') + '/'; // path with trailing slash attatched
+  const { width, height } = await startingImage.metadata();
+  if (width === undefined || height === undefined) {
+    return Promise.reject('could not determine width or height');
+  }
+  const altText = getImageAltText(originalImage, imgName);
 
-  console.time('starting to convert to different sizes and formats');
+  console.table([year, album, subAlbum, fileNameWithExt, imgDir, imgName]);
+  // THis is infelxible in terms of forcing an year/album/subalbum/photo structure, can revisit later to support n# of arbitraty connections
+
+  // This is going to get messy, in terms of if 1 fails, what do I do?
+  // a worker queue would be a simple way of doing this, let me look into options
+  // if that fails, then I can set up SQS queues
+  // Using SQS queues I could have a lambda only for image resizing, and a lambda only for
+  // putting objects in s3
+  // S3Put -> This lambda -> creates jobs for each image to resize -> diff lambda processes, creates job to upload resized to s3 -> anther lambda reads
+  // For this V1, this is an optimistic view that works
+
+  console.time('resize, convert and upload');
   await Promise.all(
     outputPhotoSizes.map(async (photoSize) => {
       console.log('working through size: ', photoSize);
@@ -156,17 +209,18 @@ exports.handler = async (event) => {
           console.time(
             `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
           );
-          await uploadImageToS3(
+          uploadImageToS3(
             imgBuffer,
             imgName,
             format.format,
             photoSize.prefix,
             imgDir,
             process.env.RESIZED_PHOTOS_BUCKET
-          );
-          console.timeEnd(
-            `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
-          );
+          ).finally(() => {
+            console.timeEnd(
+              `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
+            );
+          });
         })
       )
         .then(() => {
@@ -175,10 +229,43 @@ exports.handler = async (event) => {
           );
         })
         .catch((err) => {
-          console.log(err);
+          console.error(err);
           return;
         });
     })
   );
-  console.timeEnd('starting to convert to different sizes and formats');
+  console.timeEnd('resize, convert and upload');
+
+  // Once all this is complete, append to the database
+  // Im kinda assuming which sizes are going to be available, that's ok for now
+  // same for the formats. Later when this is more error complete, I'll append to the database
+  // only when I know all formats and sizes have been generated.
+  const query = {
+    text:
+      'INSERT INTO photos(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+    values: [
+      imgDir,
+      imgName,
+      year,
+      album,
+      subAlbum,
+      width,
+      height,
+      altText,
+      ['webp', 'jpeg', 'avif'],
+    ],
+  };
+  console.time('db insert');
+  await client
+    .query(query)
+    .then((res) => console.log(res))
+    .catch((err) => {
+      console.error(err.stack);
+      return Promise.reject('could not do db insert');
+    })
+    .finally(() => {
+      client.release();
+      console.timeEnd('db insert');
+    });
+  return Promise.resolve('resized, formatted, and inserted into db successfully');
 };
