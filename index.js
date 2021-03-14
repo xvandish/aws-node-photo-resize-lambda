@@ -252,7 +252,7 @@ exports.handler = async (event) => {
       width,
       height,
       altText,
-      ['webp', 'jpeg', 'avif'],
+      ["avif", "webp", "jpeg"],
     ],
   };
   console.time('db insert');
