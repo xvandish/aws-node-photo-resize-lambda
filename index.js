@@ -83,8 +83,8 @@ function uploadImageToS3(
 }
 
 const outputPhotoSizes = [
-  { prefix: 'small', width: 333 },
-  { prefix: '@2x', width: 667 },
+  { prefix: '_small', width: 333 },
+  { prefix: '_small@2x', width: 667 },
   { prefix: '_large', width: 1500 },
   { prefix: '_large@2x', Width: 3000 },
 ];
