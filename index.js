@@ -68,6 +68,9 @@ function uploadImageToS3(
   imgDir,
   bucketName
 ) {
+  const key = `${imgDir}${imgName}${imgSizePrefix}.${imgFormat}`;
+  console.time(`s3 upload for ${key}`);
+
   return s3
     .putObject({
       Bucket: bucketName,
@@ -75,7 +78,8 @@ function uploadImageToS3(
       Body: imgBytes,
       ContentType: `image/${imgFormat}`,
     })
-    .promise();
+    .promise()
+    .finally(() => console.timeEnd(`s3 upload for ${key}`));
 }
 
 const outputPhotoSizes = [
@@ -186,7 +190,8 @@ exports.handler = async (event) => {
   // S3Put -> This lambda -> creates jobs for each image to resize -> diff lambda processes, creates job to upload resized to s3 -> anther lambda reads
   // For this V1, this is an optimistic view that works
 
-  console.time('resize, convert and upload');
+  const s3Uploads = [];
+  console.time('resize, convert');
   await Promise.all(
     outputPhotoSizes.map(async (photoSize) => {
       console.log('working through size: ', photoSize);
@@ -209,32 +214,37 @@ exports.handler = async (event) => {
           console.time(
             `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
           );
-          uploadImageToS3(
-            imgBuffer,
-            imgName,
-            format.format,
-            photoSize.prefix,
-            imgDir,
-            process.env.RESIZED_PHOTOS_BUCKET
-          ).finally(() => {
-            console.timeEnd(
-              `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
-            );
-          });
+          s3Uploads.push(
+            uploadImageToS3(
+              imgBuffer,
+              imgName,
+              format.format,
+              photoSize.prefix,
+              imgDir,
+              process.env.RESIZED_PHOTOS_BUCKET
+            )
+          );
+          return Promise.resolve();
         })
       )
         .then(() => {
-          console.log(
-            `finished formatting and uploading all formats at ${photoSize.prefix}`
-          );
+          console.log(`finished formatting formats at ${photoSize.prefix}`);
         })
         .catch((err) => {
           console.error(err);
-          return;
+          return err;
         });
+      return Promise.resolve();
     })
   );
-  console.timeEnd('resize, convert and upload');
+  console.timeEnd('resize, convert');
+
+  await Promise.all(s3Uploads)
+    .catch((err) => {
+      console.log(err);
+      return err;
+    })
+    .finally(console.log('finished all s3 uploads'));
 
   // Once all this is complete, append to the database
   // Im kinda assuming which sizes are going to be available, that's ok for now
@@ -252,7 +262,7 @@ exports.handler = async (event) => {
       width,
       height,
       altText,
-      ['webp', 'jpeg', 'avif'],
+      ['avif', 'webp', 'jpeg'],
     ],
   };
   console.time('db insert');
