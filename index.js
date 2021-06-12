@@ -38,20 +38,6 @@ async function initializePgPool() {
   dbPool = new Pool(pgConfig)
 }
 
-
-
-// const dbPool = new Pool({
-//   max: 1,
-//   min: 0,
-//   idleTimeoutMillis: 120000,
-//   connectionTimeoutMillis: 10000,
-//   host: process.env.PHOTOS_META_DB_HOST,
-//   user: process.env.PHOTOS_META_DB_USER,
-//   password: process.env.PHOTOS_META_DB_PASSWORD,
-//   port: process.env.PHOTOS_META_DB_PORT,
-//   database: process.env.PHOTOS_META_DB_NAME,
-// });
-
 /**
  *
  * @param {string} bucket - name of the bucket
