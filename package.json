@@ -19,8 +19,9 @@
   "devDependencies": {
     "aws-sdk": "^2.858.0",
     "eslint": "^7.21.0",
+    "node-fetch": "^2.6.1",
     "pg": "^8.5.1",
+    "pg-connection-string": "^2.5.0",
     "sharp": "^0.27.2"
-  },
-  "dependencies": {}
+  }
 }

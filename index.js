@@ -3,18 +3,40 @@ const sharp = require('sharp');
 const util = require('util');
 const s3 = new AWS.S3();
 const { Pool } = require('pg');
+const fetch = require('node-fetch')
+const parsePgConnectionString = require('pg-connection-string');
 
-const pool = new Pool({
-  max: 1,
-  min: 0,
-  idleTimeoutMillis: 120000,
-  connectionTimeoutMillis: 10000,
-  host: process.env.PHOTOS_META_DB_HOST,
-  user: process.env.PHOTOS_META_DB_USER,
-  password: process.env.PHOTOS_META_DB_PASSWORD,
-  port: process.env.PHOTOS_META_DB_PORT,
-  database: process.env.PHOTOS_META_DB_NAME,
-});
+
+const herokuApiKey = process.env.HEROKU_API_KEY;
+const herokuPostgresId = process.env.HEROKU_POSTGRES_ID;
+let dbPool;
+
+async function initializePgPool() {
+  const herokuConfig = await fetch(`https://api.heroku.com/addons/${herokuPostgresId}/config`, {
+    headers: {
+      'Authorization': `Bearer ${herokuApiKey}`,
+      'Accept': 'application/vnd.heroku+json; version=3'
+    }
+  })
+    .then(res => res.json())
+    .then(data => data)
+    .catch((err) => err)
+
+  if (herokuConfig instanceof Error) {
+    return
+  }
+
+  const pgConfig = {
+    ...parsePgConnectionString(herokuConfig[0].value), // the db string returned by heroku
+    max: 1,
+    ssl: {
+      rejectUnauthorized: false
+    },
+    idleTimeoutMillis: 120000,
+    connectionTimeoutMillis: 10000,
+  }
+  dbPool = new Pool(pgConfig)
+}
 
 /**
  *
@@ -107,7 +129,7 @@ const supportedFormats = ['jpeg', 'jpg', 'png'];
  * 4. Upload the ~12 files to S3
  * 5. Update our RDS db with the photo meta of the new picture
  */
-exports.handler = async (event) => {
+exports.handler = async (event, context) => {
   console.log('Reading options from event:\n', util.inspect(event, { depth: 5 }));
   const record = event.Records[0];
   const srcBucket = record.s3.bucket.name;
@@ -136,21 +158,44 @@ exports.handler = async (event) => {
   // To store our results, we'll need a db connection
   // If we can't get one, terminate, as we don't want to store results in S3 with
   // no record of them existing in the DB
+
+  // Dont wait for the db dbPool connection to close
+  context.callbackWaitsForEmptyEventLoop = false;
+
+  // later on, I could make the request to the db as
+  // this lambda -> queue -> worker that inserts into the db
+  // for the moment, no need
+  if (!dbPool) {
+    console.log('initializing dbPool')
+    console.time('get heroku db url and initialize dbPool')
+    await initializePgPool();
+    console.timeEnd('get heroku db url and initialize dbPool')
+    if (!dbPool) {
+      return Promise.reject('could not initalize db dbPool')
+    }
+  } else {
+    console.log('dbPool already initialized')
+  }
+
+
   let client;
-  client = await pool
+  client = await dbPool
     .connect()
     .then((client) => {
       console.log('recieved client succesfully');
       return client;
     })
     .catch((err) => {
-      console.error('could not get client from PG pool');
+      console.error('could not get client from PG dbPool');
       console.error(err.stack);
       return Promise.reject('could not initialize db call');
     });
+  
+  if (client instanceof Error) {
+    return client;  // return the error
+  }
 
   console.log('succesfully connected to client');
-
   console.time('create initial sharp instance');
   // Add rotation because even if the EXIF metadata of the final images
   // mentions the correct orientation, it isn't applied automatically
@@ -252,7 +297,7 @@ exports.handler = async (event) => {
   // only when I know all formats and sizes have been generated.
   const query = {
     text:
-      'INSERT INTO photos(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      'INSERT INTO photos_meta(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)',
     values: [
       imgDir,
       imgName,
