@@ -2,60 +2,11 @@ const AWS = require('aws-sdk');
 const sharp = require('sharp');
 const util = require('util');
 const s3 = new AWS.S3();
-const { Pool } = require('pg');
-const fetch = require('node-fetch')
-const parsePgConnectionString = require('pg-connection-string');
 
-
-const herokuApiKey = process.env.HEROKU_API_KEY;
-const herokuPostgresId = process.env.HEROKU_POSTGRES_ID;
-let dbPool;
-
-async function initializePgPool() {
-  const herokuConfig = await fetch(`https://api.heroku.com/addons/${herokuPostgresId}/config`, {
-    headers: {
-      'Authorization': `Bearer ${herokuApiKey}`,
-      'Accept': 'application/vnd.heroku+json; version=3'
-    }
-  })
-    .then(res => res.json())
-    .then(data => data)
-    .catch((err) => err)
-
-  if (herokuConfig instanceof Error) {
-    return
-  }
-
-  const pgConfig = {
-    ...parsePgConnectionString(herokuConfig[0].value), // the db string returned by heroku
-    max: 1,
-    ssl: {
-      rejectUnauthorized: false
-    },
-    idleTimeoutMillis: 120000,
-    connectionTimeoutMillis: 10000,
-  }
-  dbPool = new Pool(pgConfig)
-}
-
-/**
- *
- * @param {string} bucket - name of the bucket
- * @param {string} key - name of the key
- * @param {AWS.S3} s3 - instantiated s3 object
- */
-async function getOriginalImage(bucket, key) {
-  const imageLocation = { Bucket: bucket, Key: key };
-  console.log('trying to getOriginalImage');
-  try {
-    const originalImage = await s3.getObject(imageLocation).promise();
-    console.log('got back originalImage', originalImage.Body.length);
-    return originalImage;
-  } catch (err) {
-    console.error(err);
-    return new Error('failed to download original image');
-  }
-}
+AWS.config.update({region: 'us-west-2'});
+// Create an SQS service object
+var sqs = new AWS.SQS({apiVersion: '2012-11-05'});
+var queueURL = process.env.IMAGE_META_TO_PG_QUEUE_URL;
 
 /**
  *
@@ -73,13 +24,21 @@ function getImageAltText(imageBlobFromS3, imgNameNoExt) {
   return imgNameNoExt.replace(/[^A-Z0-9]/gi, ' ');
 }
 
-/**
- *
- * @param {sharp.Sharp} sharpImage
- * @param {string} desiredFormat
- */
-function convertImageToFormatAndReturnBuffer(sharpImage, desiredFormat) {
-  return sharpImage[desiredFormat.format]({ quality: desiredFormat.quality }).toBuffer();
+function deletePartialResults(imgName, imgDir) {
+  return s3
+    .deleteObjects({
+      Bucket: process.env.RESIZED_PHOTOS_BUCKET,
+      Delete: {
+        Objects: outputPhotoSizes
+          .map((size) =>
+            outputFormats.map((format) => ({
+              Key: `${imgDir}${imgName}${size.prefix}.${format.format}`,
+            }))
+          )
+          .flat(1),
+      },
+    })
+    .promise()
 }
 
 function uploadImageToS3(
@@ -127,13 +86,14 @@ const supportedFormats = ['jpeg', 'jpg', 'png'];
  * 3. For every size in photoSizes, resize the image.
  *    3.a. Convert each size into jpeg, webp and avif formats
  * 4. Upload the ~12 files to S3
- * 5. Update our RDS db with the photo meta of the new picture
+ * 5. Send a notification to SQS that this result needs to be added to a db. Another lambda will insert
  */
 exports.handler = async (event, context) => {
   console.log('Reading options from event:\n', util.inspect(event, { depth: 5 }));
   const record = event.Records[0];
   const srcBucket = record.s3.bucket.name;
-  const srcKey = record.s3.object.key;
+  // Object key may have spaces or unicode non-ASCII characters.
+  const srcKey    = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "))
 
   // Get the extension from the file name
   const typeMatch = srcKey.match(/\.([^.]*)$/);
@@ -151,56 +111,17 @@ exports.handler = async (event, context) => {
 
   console.table([srcBucket, srcKey, imageType]);
 
-  const originalImage = await getOriginalImage(srcBucket, srcKey);
-  if (originalImage instanceof Error) return;
-  console.log('succesfully recieved originalImage');
-
-  // To store our results, we'll need a db connection
-  // If we can't get one, terminate, as we don't want to store results in S3 with
-  // no record of them existing in the DB
-
-  // Dont wait for the db dbPool connection to close
-  context.callbackWaitsForEmptyEventLoop = false;
-
-  // later on, I could make the request to the db as
-  // this lambda -> queue -> worker that inserts into the db
-  // for the moment, no need
-  if (!dbPool) {
-    console.log('initializing dbPool')
-    console.time('get heroku db url and initialize dbPool')
-    await initializePgPool();
-    console.timeEnd('get heroku db url and initialize dbPool')
-    if (!dbPool) {
-      return Promise.reject('could not initalize db dbPool')
-    }
-  } else {
-    console.log('dbPool already initialized')
+  let originalImage;
+  let startingImage;
+  try {
+    originalImage = await s3.getObject({ Bucket: srcBucket, Key: srcKey }).promise();
+    // Add rotation because even if the EXIF metadata of the final images
+    // mentions the correct orientation, it isn't applied automatically
+    startingImage = await sharp(originalImage.Body).rotate();
+  } catch (err) {
+    console.error(err)
+    return Promise.reject(err);
   }
-
-
-  let client;
-  client = await dbPool
-    .connect()
-    .then((client) => {
-      console.log('recieved client succesfully');
-      return client;
-    })
-    .catch((err) => {
-      console.error('could not get client from PG dbPool');
-      console.error(err.stack);
-      return Promise.reject('could not initialize db call');
-    });
-  
-  if (client instanceof Error) {
-    return client;  // return the error
-  }
-
-  console.log('succesfully connected to client');
-  console.time('create initial sharp instance');
-  // Add rotation because even if the EXIF metadata of the final images
-  // mentions the correct orientation, it isn't applied automatically
-  const startingImage = await sharp(originalImage.Body).rotate();
-  console.timeEnd('create initial sharp instance');
 
   // Derive information about the image based on path
   // TODO: fix this next line in case subAlbum is null
@@ -218,6 +139,7 @@ exports.handler = async (event, context) => {
   }
   const imgName = fileNameWithExt.replace(typeMatch[0], ''); // replace the extension with an empty string
   const imgDir = pathParts.slice(0, -1).join('/') + '/'; // path with trailing slash attatched
+
   const { width, height } = await startingImage.metadata();
   if (width === undefined || height === undefined) {
     return Promise.reject('could not determine width or height');
@@ -236,68 +158,71 @@ exports.handler = async (event, context) => {
   // For this V1, this is an optimistic view that works
 
   const s3Uploads = [];
-  console.time('resize, convert');
-  await Promise.all(
-    outputPhotoSizes.map(async (photoSize) => {
-      console.log('working through size: ', photoSize);
-      const resized = await startingImage
+  // partial results are useless and I can't track down errors easily right now
+  // generate all buffers first. 
+  // then start s3 uploads
+
+  for (var i = 0; i < outputPhotoSizes.length; i++) {
+    const photoSize = outputPhotoSizes[i];
+
+    let resized;
+    try {
+      resized = await startingImage
+      .clone()
+      .resize({ fit: 'inside', width: photoSize.width })
+
+
+      for (var j = 0; j < outputFormats.length; j++) {
+        const format = outputFormats[j];
+        console.time(`converted ${imgName} at ${photoSize.prefix} to ${format.format}`);
+        const imgBuffer = await resized
         .clone()
-        .resize({ fit: 'inside', width: photoSize.width });
+        .toFormat(format.format, { quality: format.quality, })
+        .toBuffer()
+        console.timeEnd(`converted ${imgName} at ${photoSize.prefix} to ${format.format}`);
 
-      await Promise.all(
-        outputFormats.map(async (format) => {
-          console.log('working through format', format);
-          console.time(`converted ${imgName} at ${photoSize.prefix} to ${format.format}`);
-          const imgBuffer = await convertImageToFormatAndReturnBuffer(
-            resized.clone(),
-            format
-          );
-          console.timeEnd(
-            `converted ${imgName} at ${photoSize.prefix} to ${format.format}`
-          );
-          if (imgBuffer instanceof Error) return Promise.reject(imgBuffer);
-          console.time(
-            `upload to s3 for ${imgName} at ${photoSize.prefix} to ${format.format}`
-          );
-          s3Uploads.push(
-            uploadImageToS3(
-              imgBuffer,
-              imgName,
-              format.format,
-              photoSize.prefix,
-              imgDir,
-              process.env.RESIZED_PHOTOS_BUCKET
-            )
-          );
-          return Promise.resolve();
-        })
-      )
-        .then(() => {
-          console.log(`finished formatting formats at ${photoSize.prefix}`);
-        })
-        .catch((err) => {
-          console.error(err);
-          return err;
-        });
-      return Promise.resolve();
-    })
-  );
-  console.timeEnd('resize, convert');
+        // push a function that calls our function, so we can execute this later
+        s3Uploads.push(() =>
+          uploadImageToS3(
+            imgBuffer,
+            imgName,
+            format.format,
+            photoSize.prefix,
+            imgDir,
+            process.env.RESIZED_PHOTOS_BUCKET
+          )
+        )
+      }
+    } catch (err) {
+      console.error(err);
+      return Promise.reject(err);
+    }
+  }
 
-  await Promise.all(s3Uploads)
-    .catch((err) => {
-      console.log(err);
-      return err;
-    })
-    .finally(console.log('finished all s3 uploads'));
-
+  
+  try {
+    await Promise.all(s3Uploads.map(future => future()));
+  } catch (err) {
+    console.error(err);
+    try {
+      // Try to clean up any uploads that we now can't use
+      await deletePartialResults(imgName, imgDir);
+      console.log('partial uploads deleted')
+    } catch (nestedErr) {
+      console.error(nestedErr);
+      return Promise.reject(err)
+    }
+    
+  }
+ 
   // Once all this is complete, append to the database
   // Im kinda assuming which sizes are going to be available, that's ok for now
   // same for the formats. Later when this is more error complete, I'll append to the database
   // only when I know all formats and sizes have been generated.
+
   const query = {
     text:
-      'INSERT INTO photos_meta(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      'INSERT INTO photos_meta(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING',
     values: [
       imgDir,
       imgName,
@@ -310,17 +235,18 @@ exports.handler = async (event, context) => {
       ['avif', 'webp', 'jpeg'],
     ],
   };
-  console.time('db insert');
-  await client
-    .query(query)
-    .then((res) => console.log(res))
-    .catch((err) => {
-      console.error(err.stack);
-      return Promise.reject('could not do db insert');
-    })
-    .finally(() => {
-      client.release();
-      console.timeEnd('db insert');
-    });
-  return Promise.resolve('resized, formatted, and inserted into db successfully');
+
+  // Create publish parameters
+  const params = {
+    MessageBody: JSON.stringify(query),
+    QueueUrl: queueURL
+  };
+
+  try {
+    const x = await sqs.sendMessage(params).promise();
+    console.log('published to sqs fine - ', x);
+  } catch (err) {
+    console.log(err);
+    return err;
+  }
 };
