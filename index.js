@@ -71,9 +71,9 @@ const outputPhotoSizes = [
 ];
 
 const outputFormats = [
-  { format: 'webp', quality: 82 },
-  { format: 'jpeg', quality: 80 },
-  { format: 'avif', quality: 64 },
+  // { format: 'webp', quality: 82 },
+  { format: 'jpeg', quality: 90 },
+  { format: 'avif', quality: 80 },
 ];
 
 const supportedFormats = ['jpeg', 'jpg', 'png'];
@@ -84,7 +84,7 @@ const supportedFormats = ['jpeg', 'jpg', 'png'];
  * 1. Check if notification was for a file
  * 2. Check if it was for an image, and if so, the right format
  * 3. For every size in photoSizes, resize the image.
- *    3.a. Convert each size into jpeg, webp and avif formats
+ *    3.a. Convert each size into jpeg, ~webp~ and avif formats
  * 4. Upload the ~12 files to S3
  * 5. Send a notification to SQS that this result needs to be added to a db. Another lambda will insert
  */
@@ -214,34 +214,52 @@ exports.handler = async (event, context) => {
     }
     
   }
+  
+  // We no longer write to a database, we instead simply write to a json file
+  // so we can just publish a stringified json blob.
+  const metaInfo = {
+    "dir_path": imgDir,
+    "name": imgName,
+    "year": year,
+    "album_name": album,
+    "subalbum_name": subAlbum,
+    "width": width,
+    "height": height,
+    "alt_text": altText,
+    "available_formats": ['avif', 'jpeg'],
+  }
  
   // Once all this is complete, append to the database
   // Im kinda assuming which sizes are going to be available, that's ok for now
   // same for the formats. Later when this is more error complete, I'll append to the database
   // only when I know all formats and sizes have been generated.
 
-  const query = {
-    text:
-      'INSERT INTO photos_meta(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING',
-    values: [
-      imgDir,
-      imgName,
-      year,
-      album,
-      subAlbum,
-      width,
-      height,
-      altText,
-      ['avif', 'webp', 'jpeg'],
-    ],
-  };
+  // const query = {
+  //   text:
+  //     'INSERT INTO photos_meta(dir_path, name, year, album_name, subalbum_name, width, height, alt_text, available_formats) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING',
+  //   values: [
+  //     imgDir,
+  //     imgName,
+  //     year,
+  //     album,
+  //     subAlbum,
+  //     width,
+  //     height,
+  //     altText,
+  //     ['avif', 'webp', 'jpeg'],
+  //   ],
+  // };
 
   // Create publish parameters
+  const metaInfoString = JSON.stringify(metaInfo);
+  console.log({ metaInfoString });
   const params = {
-    MessageBody: JSON.stringify(query),
+    MessageBody: metaInfoString,
     QueueUrl: queueURL
   };
 
+  // Alright, since our database is going away, what should we do? Append rows to a text file, or log them out and append them manually? 
+  // Manually would be so much easier.
   try {
     const x = await sqs.sendMessage(params).promise();
     console.log('published to sqs fine - ', x);
@@ -250,3 +268,4 @@ exports.handler = async (event, context) => {
     return err;
   }
 };
+
